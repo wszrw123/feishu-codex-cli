@@ -1,4 +1,5 @@
 import atexit
+from collections import deque
 import fcntl
 import json
 import logging
@@ -6,6 +7,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -28,6 +30,15 @@ CODEX_HOME_PATH = RUNTIME_DIR / "codex-home"
 LOCK_PATH = RUNTIME_DIR / "service.lock"
 HEARTBEAT_PATH = RUNTIME_DIR / "heartbeat.json"
 LOCK_HANDLE: Any = None
+STATE_LOCK = threading.Lock()
+TASK_QUEUE: deque[str] = deque()
+CURRENT_TASK: dict[str, Any] = {
+    "trace_id": "",
+    "text": "",
+    "started_at": 0.0,
+    "process": None,
+    "cancel_requested": False,
+}
 
 
 def _utc_now_text() -> str:
@@ -94,6 +105,81 @@ def _acquire_single_instance_lock() -> None:
     handle.flush()
     LOCK_HANDLE = handle
     atexit.register(_release_single_instance_lock)
+
+
+def _enqueue_message(text: str) -> int:
+    with STATE_LOCK:
+        ahead = len(TASK_QUEUE) + (1 if CURRENT_TASK.get("trace_id") else 0)
+        TASK_QUEUE.append(text)
+        return ahead
+
+
+def _dequeue_message() -> str:
+    with STATE_LOCK:
+        return TASK_QUEUE.popleft() if TASK_QUEUE else ""
+
+
+def _queue_size() -> int:
+    with STATE_LOCK:
+        return len(TASK_QUEUE)
+
+
+def _set_current_task(trace_id: str, text: str) -> None:
+    with STATE_LOCK:
+        CURRENT_TASK.update(
+            trace_id=trace_id,
+            text=text,
+            started_at=time.time(),
+            process=None,
+            cancel_requested=False,
+        )
+
+
+def _set_current_process(process: subprocess.Popen[str]) -> None:
+    with STATE_LOCK:
+        if CURRENT_TASK.get("trace_id"):
+            CURRENT_TASK["process"] = process
+
+
+def _current_task_snapshot() -> dict[str, Any]:
+    with STATE_LOCK:
+        process = CURRENT_TASK.get("process")
+        pid = process.pid if process and process.poll() is None else None
+        return {
+            "trace_id": str(CURRENT_TASK.get("trace_id", "") or "").strip(),
+            "text": str(CURRENT_TASK.get("text", "") or "").strip(),
+            "started_at": float(CURRENT_TASK.get("started_at", 0.0) or 0.0),
+            "pid": pid,
+            "cancel_requested": bool(CURRENT_TASK.get("cancel_requested", False)),
+        }
+
+
+def _current_task_cancel_requested() -> bool:
+    with STATE_LOCK:
+        return bool(CURRENT_TASK.get("cancel_requested", False))
+
+
+def _clear_current_task() -> None:
+    with STATE_LOCK:
+        CURRENT_TASK.update(trace_id="", text="", started_at=0.0, process=None, cancel_requested=False)
+
+
+def _cancel_current_task() -> str:
+    with STATE_LOCK:
+        trace_id = str(CURRENT_TASK.get("trace_id", "") or "").strip()
+        process = CURRENT_TASK.get("process")
+        if not trace_id:
+            return "当前没有进行中的任务。"
+        CURRENT_TASK["cancel_requested"] = True
+    if process and process.poll() is None:
+        try:
+            process.terminate()
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+        except Exception:
+            pass
+    return f"已取消当前任务(trace_id={trace_id})。"
 
 
 def _load_config() -> dict[str, Any]:
@@ -164,6 +250,10 @@ DIAGNOSTIC_HINTS = (
     "heartbeat",
     "openclaw",
 )
+
+
+class CodexCancelled(RuntimeError):
+    pass
 
 
 def _is_diagnostic_request(text: str) -> bool:
@@ -550,19 +640,44 @@ def _run_codex(prompt: str, mode: str, session_id: str) -> tuple[int, str, dict[
     else:
         cmd.extend([prompt, "--json"])
     started = time.monotonic()
-    completed = subprocess.run(
+    if _current_task_cancel_requested():
+        raise CodexCancelled("cancelled before codex start")
+    completed = subprocess.Popen(
         cmd,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=CODEX_TIMEOUT_SECONDS,
-        check=False,
         env=_prepare_codex_env() or None,
     )
+    _set_current_process(completed)
+    try:
+        stdout_text, stderr_text = completed.communicate(timeout=CODEX_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        completed.kill()
+        completed.communicate()
+        raise
     elapsed = time.monotonic() - started
-    stdout_text = completed.stdout or ""
+    stdout_text = stdout_text or ""
+    stderr_text = stderr_text or ""
+    if _current_task_cancel_requested():
+        raise CodexCancelled("cancelled while codex running")
     usage = _extract_usage(stdout_text)
     thread_id = _extract_thread_id(stdout_text)
-    return completed.returncode, stdout_text + (completed.stderr or ""), usage, elapsed, thread_id
+    return completed.returncode, stdout_text + stderr_text, usage, elapsed, thread_id
+
+
+def _build_status_text() -> str:
+    context = _current_context()
+    current = _current_task_snapshot()
+    return (
+        f"workdir={CODEX_WORKDIR}\n"
+        f"session_id={_stored_session_id() or '-'}\n"
+        f"summary_chars={len(str(context.get('summary_text', '') or ''))}\n"
+        f"last_input_tokens={context.get('last_input_tokens', '-')}\n"
+        f"last_elapsed_seconds={context.get('last_elapsed_seconds', '-')}\n"
+        f"queue_size={_queue_size()}\n"
+        f"current_trace_id={current.get('trace_id') or '-'}"
+    )
 
 
 def _should_rotate(usage: dict[str, int], elapsed: float) -> bool:
@@ -583,86 +698,86 @@ def _should_preemptive_rotate(context: dict[str, Any]) -> bool:
 
 def _handle_message(text: str) -> None:
     trace_id = uuid.uuid4().hex[:8]
+    _set_current_task(trace_id, text)
     logger.info("message in trace_id=%s text=%s", trace_id, _clip_text(text, 200))
     _append_conversation_event(trace_id, "user", text, "ok")
-
-    if text.strip() in {"/status", "/relay_status"}:
-        context = _current_context()
-        status_text = (
-            f"workdir={CODEX_WORKDIR}\n"
-            f"session_id={_stored_session_id() or '-'}\n"
-            f"summary_chars={len(str(context.get('summary_text', '') or ''))}\n"
-            f"last_input_tokens={context.get('last_input_tokens', '-')}\n"
-            f"last_elapsed_seconds={context.get('last_elapsed_seconds', '-')}"
-        )
-        _feishu_send_text(FEISHU_CHAT_ID, status_text)
-        return
-
-    context = _current_context()
-    session_id = _stored_session_id()
-    use_resume = bool(session_id) and not _is_diagnostic_request(text)
-    if session_id and _should_preemptive_rotate(context):
-        use_resume = False
-    summary_text = ""
-    if not use_resume:
-        summary_reason = "diagnostic_exec_new" if _is_diagnostic_request(text) else "summary_exec_new"
-        summary_text = _build_summary(summary_reason)
-        if summary_text:
-            _store_context(summary_text=summary_text, summary_reason=summary_reason)
-
-    prompt = _build_prompt(text, trace_id, summary_text=summary_text)
-    mode = "resume_session" if use_resume else "exec_new"
-    _feishu_send_text(FEISHU_CHAT_ID, "已收到，正在处理...")
-
     try:
+        context = _current_context()
+        session_id = _stored_session_id()
+        use_resume = bool(session_id) and not _is_diagnostic_request(text)
+        if session_id and _should_preemptive_rotate(context):
+            use_resume = False
+        summary_text = ""
+        if not use_resume:
+            summary_reason = "diagnostic_exec_new" if _is_diagnostic_request(text) else "summary_exec_new"
+            summary_text = _build_summary(summary_reason)
+            if summary_text:
+                _store_context(summary_text=summary_text, summary_reason=summary_reason)
+
+        prompt = _build_prompt(text, trace_id, summary_text=summary_text)
+        mode = "resume_session" if use_resume else "exec_new"
+        _feishu_send_text(FEISHU_CHAT_ID, "已收到，正在处理...")
+
         rc, output_text, usage, elapsed, thread_id = _run_codex(prompt, mode, session_id)
+        message_text = _extract_agent_text(output_text).strip()
+        if rc != 0:
+            detail = message_text or _clip_text(output_text, 600) or f"codex exit={rc}"
+            _clear_session_id()
+            _append_conversation_event(trace_id, "assistant", detail, "error")
+            _feishu_send_text(FEISHU_CHAT_ID, f"转发失败(trace_id={trace_id}): {_clip_text(detail, REPLY_MAX_CHARS)}")
+            return
+
+        if thread_id and not _should_rotate(usage, elapsed):
+            _store_session_id(thread_id)
+        else:
+            _clear_session_id()
+
+        _store_context(
+            last_input_tokens=int(usage.get("input_tokens", 0) or 0),
+            last_cached_input_tokens=int(usage.get("cached_input_tokens", 0) or 0),
+            last_output_tokens=int(usage.get("output_tokens", 0) or 0),
+            last_elapsed_seconds=round(elapsed, 2),
+            last_session_id=thread_id,
+            last_trace_id=trace_id,
+            last_activity_at=_utc_now_text(),
+        )
+
+        reply_text = message_text or "消息已处理，但未提取到文本回复。"
+        _append_conversation_event(trace_id, "assistant", reply_text, "ok")
+        _feishu_send_text(FEISHU_CHAT_ID, _clip_text(reply_text, REPLY_MAX_CHARS))
+        logger.info(
+            "codex done trace_id=%s mode=%s elapsed=%.2fs input_tokens=%s cached_input_tokens=%s output_tokens=%s",
+            trace_id,
+            mode,
+            elapsed,
+            usage.get("input_tokens", "-"),
+            usage.get("cached_input_tokens", "-"),
+            usage.get("output_tokens", "-"),
+        )
     except subprocess.TimeoutExpired:
         _clear_session_id()
         _append_conversation_event(trace_id, "assistant", f"转发超时(trace_id={trace_id})", "error")
         _feishu_send_text(FEISHU_CHAT_ID, f"转发超时(trace_id={trace_id}, timeout={CODEX_TIMEOUT_SECONDS}s)")
-        return
+    except CodexCancelled:
+        _clear_session_id()
+        _append_conversation_event(trace_id, "assistant", f"任务已取消(trace_id={trace_id})", "cancelled")
+        _feishu_send_text(FEISHU_CHAT_ID, f"任务已取消(trace_id={trace_id})")
     except Exception as exc:
         _clear_session_id()
         detail = f"转发失败(trace_id={trace_id}): {str(exc)[:300]}"
         _append_conversation_event(trace_id, "assistant", detail, "error")
         _feishu_send_text(FEISHU_CHAT_ID, detail)
-        return
+    finally:
+        _clear_current_task()
 
-    message_text = _extract_agent_text(output_text).strip()
-    if rc != 0:
-        detail = message_text or _clip_text(output_text, 600) or f"codex exit={rc}"
-        _clear_session_id()
-        _append_conversation_event(trace_id, "assistant", detail, "error")
-        _feishu_send_text(FEISHU_CHAT_ID, f"转发失败(trace_id={trace_id}): {_clip_text(detail, REPLY_MAX_CHARS)}")
-        return
 
-    if thread_id and not _should_rotate(usage, elapsed):
-        _store_session_id(thread_id)
-    else:
-        _clear_session_id()
-
-    _store_context(
-        last_input_tokens=int(usage.get("input_tokens", 0) or 0),
-        last_cached_input_tokens=int(usage.get("cached_input_tokens", 0) or 0),
-        last_output_tokens=int(usage.get("output_tokens", 0) or 0),
-        last_elapsed_seconds=round(elapsed, 2),
-        last_session_id=thread_id,
-        last_trace_id=trace_id,
-        last_activity_at=_utc_now_text(),
-    )
-
-    reply_text = message_text or "消息已处理，但未提取到文本回复。"
-    _append_conversation_event(trace_id, "assistant", reply_text, "ok")
-    _feishu_send_text(FEISHU_CHAT_ID, _clip_text(reply_text, REPLY_MAX_CHARS))
-    logger.info(
-        "codex done trace_id=%s mode=%s elapsed=%.2fs input_tokens=%s cached_input_tokens=%s output_tokens=%s",
-        trace_id,
-        mode,
-        elapsed,
-        usage.get("input_tokens", "-"),
-        usage.get("cached_input_tokens", "-"),
-        usage.get("output_tokens", "-"),
-    )
+def _worker_loop() -> None:
+    while True:
+        text = _dequeue_message()
+        if not text:
+            time.sleep(0.2)
+            continue
+        _handle_message(text)
 
 
 def main() -> None:
@@ -679,6 +794,7 @@ def main() -> None:
     _update_heartbeat("starting", workdir=CODEX_WORKDIR, cli=CODEX_CLI_PATH)
     if STARTUP_MESSAGE:
         _feishu_send_text(FEISHU_CHAT_ID, STARTUP_MESSAGE)
+    threading.Thread(target=_worker_loop, name="feishu-codex-worker", daemon=True).start()
 
     while True:
         _update_heartbeat("running", last_seen_ms=last_seen_ms)
@@ -702,6 +818,7 @@ def main() -> None:
             text = _feishu_message_text(item)
             if not text:
                 continue
+            content = text.strip()
 
             if message_id:
                 seen_ids.add(message_id)
@@ -713,7 +830,16 @@ def main() -> None:
             if created_ms > last_seen_ms:
                 last_seen_ms = created_ms
 
-            _handle_message(text.strip())
+            if content in {"/status", "/relay_status"}:
+                _feishu_send_text(FEISHU_CHAT_ID, _build_status_text())
+                continue
+            if content == "/cancel":
+                _feishu_send_text(FEISHU_CHAT_ID, _cancel_current_task())
+                continue
+
+            ahead = _enqueue_message(content)
+            if ahead > 0:
+                _feishu_send_text(FEISHU_CHAT_ID, f"已排队，当前前面还有 {ahead} 条消息。")
 
         time.sleep(POLL_INTERVAL_SECONDS)
 
