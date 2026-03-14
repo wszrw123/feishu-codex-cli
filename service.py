@@ -517,6 +517,12 @@ def _extract_agent_text(stdout_text: str) -> str:
                 message = str(payload.get("message", "") or "").strip()
                 if message:
                     chunks.append(message)
+        if event.get("type") == "item.completed":
+            item = event.get("item", {})
+            if isinstance(item, dict) and item.get("type") == "agent_message":
+                message = str(item.get("text", "") or "").strip()
+                if message:
+                    chunks.append(message)
         if event.get("type") == "response_item":
             payload = event.get("payload", {})
             if isinstance(payload, dict) and payload.get("type") == "message":
