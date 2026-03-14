@@ -1,0 +1,23 @@
+{
+  "feishuAppId": "",
+  "feishuAppSecret": "",
+  "feishuChatId": "",
+  "feishuApiBase": "https://open.feishu.cn/open-apis",
+  "codexCliPath": "/opt/homebrew/bin/codex",
+  "codexWorkdir": "/Users/zhengrongwei/Desktop/person/xcode-tg",
+  "codexSandboxMode": "danger-full-access",
+  "codexSkipGitRepoCheck": true,
+  "codexTimeoutSeconds": 900,
+  "openaiBaseUrl": "https://w.ciykj.cn",
+  "openaiApiKey": "",
+  "chatSummaryMaxChars": 2500,
+  "chatSummaryMaxEvents": 10,
+  "chatSessionMaxInputTokens": 150000,
+  "chatSessionMaxElapsedSeconds": 120,
+  "chatSessionIdleSummarySeconds": 900,
+  "chatSessionPreemptiveRotateRatio": 0.8,
+  "pollIntervalSeconds": 2.5,
+  "historyPageSize": 20,
+  "replyMaxChars": 4000,
+  "startupMessage": "feishu-codex-cli 已上线。"
+}
