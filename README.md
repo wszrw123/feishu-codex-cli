@@ -4,6 +4,9 @@ A lightweight local bridge between Feishu and Codex CLI.
 
 一个轻量的本地 Feishu <-> Codex CLI 中继服务。
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
+[![Release](https://img.shields.io/github/v/tag/wszrw123/feishu-codex-cli?label=release)](https://github.com/wszrw123/feishu-codex-cli/tags)
+
 ## Overview
 
 `feishu-codex-cli` is designed for a simple workflow: receive messages from one Feishu group chat, run Codex CLI locally, and send the response back with minimal runtime overhead.
@@ -25,6 +28,28 @@ A lightweight local bridge between Feishu and Codex CLI.
 - 遇到诊断类请求时默认不走 `resume`
 - 记录每次 Codex 调用的 token 用量和耗时
 - 支持按需配置 `OPENAI_BASE_URL`
+
+## Use Cases
+
+- Personal coding assistant inside a Feishu group chat
+- A lightweight alternative to heavier relay stacks
+- Workspace-local automation with explicit context limits
+
+- 在飞书群里使用个人编码助手
+- 作为更重型中继方案的轻量替代
+- 用于本地工作区自动化，并显式限制上下文膨胀
+
+## Requirements
+
+- Python 3.10+
+- Codex CLI installed and available in `PATH`
+- A Feishu app with permission to read and send group messages
+- A target Feishu group `chat_id`
+
+- Python 3.10+
+- 已安装并可执行的 Codex CLI
+- 具备群消息读取和发送权限的飞书应用
+- 目标飞书群的 `chat_id`
 
 ## Files
 
@@ -57,6 +82,12 @@ Fill in `.feishu-codex-cli.config.local.json` with your own values:
 ```bash
 ./start-feishu-codex.sh
 ```
+
+### 3. Verify runtime output
+
+Check `.runtime/service.log` if the service starts but does not reply as expected.
+
+如果服务启动了但没有正常回复，优先查看 `.runtime/service.log`。
 
 ## Configuration Notes
 
@@ -92,8 +123,24 @@ To keep the bridge responsive over long conversations, the service uses a few gu
 - 诊断类请求会优先走新的 Codex 执行流程
 - 当 token 或耗时过大时会自动轮换会话
 
+## Suggested Workflow
+
+- Keep one Feishu group dedicated to one workspace or project
+- Use short task-oriented prompts for better reply quality
+- Let the bridge rotate sessions when conversations become too large
+
+- 一个飞书群最好只对应一个工作区或项目
+- 任务型短提示词通常能获得更稳定的回复
+- 当会话变大时，让服务自动轮换 session 会更稳妥
+
 ## Privacy
 
 The sample config intentionally leaves secrets blank and uses placeholder paths. Do not commit `.feishu-codex-cli.config.local.json` or runtime files.
 
 示例配置故意留空密钥并使用占位路径。请不要提交 `.feishu-codex-cli.config.local.json` 和运行时文件。
+
+## License
+
+Released under the MIT License.
+
+基于 MIT License 开源。
