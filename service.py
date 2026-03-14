@@ -1,6 +1,5 @@
 import atexit
 from collections import deque
-import fcntl
 import json
 import logging
 import os
@@ -15,6 +14,11 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 
 ROOT = Path(__file__).resolve().parent
@@ -78,7 +82,11 @@ def _release_single_instance_lock() -> None:
         LOCK_HANDLE.truncate()
         LOCK_HANDLE.write("")
         LOCK_HANDLE.flush()
-        fcntl.flock(LOCK_HANDLE.fileno(), fcntl.LOCK_UN)
+        if os.name == "nt":
+            LOCK_HANDLE.seek(0)
+            msvcrt.locking(LOCK_HANDLE.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(LOCK_HANDLE.fileno(), fcntl.LOCK_UN)
     except Exception:
         pass
     try:
@@ -92,8 +100,12 @@ def _acquire_single_instance_lock() -> None:
     global LOCK_HANDLE
     handle = LOCK_PATH.open("a+", encoding="utf-8")
     try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError as exc:
+        if os.name == "nt":
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError) as exc:
         handle.seek(0)
         existing = handle.read().strip()
         handle.close()
