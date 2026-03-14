@@ -89,6 +89,28 @@ Check `.runtime/service.log` if the service starts but does not reply as expecte
 
 如果服务启动了但没有正常回复，优先查看 `.runtime/service.log`。
 
+## Auto Start on macOS
+
+Install a per-user `launchd` agent so the service starts automatically after login:
+
+通过用户级 `launchd` 安装登录后自启动：
+
+```bash
+./install-autostart-macos.sh
+```
+
+Remove the auto-start agent if needed:
+
+如需取消自启动：
+
+```bash
+./uninstall-autostart-macos.sh
+```
+
+The generated agent file will be placed at `~/Library/LaunchAgents/com.zhengrongwei.feishu-codex-cli.plist`.
+
+生成的自启动文件位于 `~/Library/LaunchAgents/com.zhengrongwei.feishu-codex-cli.plist`。
+
 ## Configuration Notes
 
 - `codexCliPath`: path to the Codex CLI binary, or simply `codex` if it is already in `PATH`
