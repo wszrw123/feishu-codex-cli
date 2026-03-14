@@ -1,3 +1,5 @@
+import atexit
+import fcntl
 import json
 import logging
 import os
@@ -23,6 +25,9 @@ CONVERSATION_LOG_PATH = RUNTIME_DIR / "conversation.jsonl"
 CHAT_CONTEXT_PATH = RUNTIME_DIR / "chat_context.json"
 SESSION_STORE_PATH = RUNTIME_DIR / "chat_session.json"
 CODEX_HOME_PATH = RUNTIME_DIR / "codex-home"
+LOCK_PATH = RUNTIME_DIR / "service.lock"
+HEARTBEAT_PATH = RUNTIME_DIR / "heartbeat.json"
+LOCK_HANDLE: Any = None
 
 
 def _utc_now_text() -> str:
@@ -40,6 +45,55 @@ def _read_json_file(path: Path, fallback: Any) -> Any:
 
 def _write_json_file(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _update_heartbeat(status: str, **extra: Any) -> None:
+    payload = {
+        "pid": os.getpid(),
+        "status": status,
+        "updated_at": _utc_now_text(),
+        "timestamp": int(time.time()),
+    }
+    payload.update(extra)
+    _write_json_file(HEARTBEAT_PATH, payload)
+
+
+def _release_single_instance_lock() -> None:
+    global LOCK_HANDLE
+    if not LOCK_HANDLE:
+        return
+    try:
+        LOCK_HANDLE.seek(0)
+        LOCK_HANDLE.truncate()
+        LOCK_HANDLE.write("")
+        LOCK_HANDLE.flush()
+        fcntl.flock(LOCK_HANDLE.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        pass
+    try:
+        LOCK_HANDLE.close()
+    except Exception:
+        pass
+    LOCK_HANDLE = None
+
+
+def _acquire_single_instance_lock() -> None:
+    global LOCK_HANDLE
+    handle = LOCK_PATH.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        handle.seek(0)
+        existing = handle.read().strip()
+        handle.close()
+        detail = f"another service instance is already running ({existing})" if existing else "another service instance is already running"
+        raise RuntimeError(detail) from exc
+    handle.seek(0)
+    handle.truncate()
+    handle.write(json.dumps({"pid": os.getpid(), "started_at": _utc_now_text()}, ensure_ascii=False))
+    handle.flush()
+    LOCK_HANDLE = handle
+    atexit.register(_release_single_instance_lock)
 
 
 def _load_config() -> dict[str, Any]:
@@ -606,6 +660,7 @@ def _handle_message(text: str) -> None:
 
 
 def main() -> None:
+    _acquire_single_instance_lock()
     if not FEISHU_APP_ID or not FEISHU_APP_SECRET or not FEISHU_CHAT_ID:
         raise RuntimeError("missing feishuAppId / feishuAppSecret / feishuChatId in config")
 
@@ -615,14 +670,17 @@ def main() -> None:
     last_seen_ms = int(time.time() * 1000)
 
     logger.info("service starting workdir=%s cli=%s base_url=%s", CODEX_WORKDIR, CODEX_CLI_PATH, OPENAI_BASE_URL or "(inherit)")
+    _update_heartbeat("starting", workdir=CODEX_WORKDIR, cli=CODEX_CLI_PATH)
     if STARTUP_MESSAGE:
         _feishu_send_text(FEISHU_CHAT_ID, STARTUP_MESSAGE)
 
     while True:
+        _update_heartbeat("running", last_seen_ms=last_seen_ms)
         try:
             items = _feishu_list_chat_messages(FEISHU_CHAT_ID)
         except Exception as exc:
             logger.warning("feishu pull failed error=%s", str(exc)[:300])
+            _update_heartbeat("degraded", error=str(exc)[:300], last_seen_ms=last_seen_ms)
             time.sleep(POLL_INTERVAL_SECONDS)
             continue
 

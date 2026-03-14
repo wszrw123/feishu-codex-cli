@@ -111,6 +111,16 @@ The generated agent file will be placed at `~/Library/LaunchAgents/com.zhengrong
 
 生成的自启动文件位于 `~/Library/LaunchAgents/com.zhengrongwei.feishu-codex-cli.plist`。
 
+The install script also adds a lightweight watchdog that checks the heartbeat every 60 seconds and restarts the service if it goes stale.
+
+安装脚本还会额外创建一个轻量 watchdog，每 60 秒检查一次心跳；如果主服务掉线或卡死到心跳超时，会自动拉起。
+
+## Single Instance Guarantee
+
+The service uses a lock file under `.runtime/service.lock` so only one process can stay active at a time, whether started manually or by `launchd`.
+
+服务会使用 `.runtime/service.lock` 做单实例锁，无论是手动启动还是 `launchd` 拉起，同一时刻都只允许一个实例在线。
+
 ## Configuration Notes
 
 - `codexCliPath`: path to the Codex CLI binary, or simply `codex` if it is already in `PATH`
